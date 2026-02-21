@@ -10,7 +10,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_target(false)
         .init();
 
-    // Initialize the Vertex AI gRPC client (ADC + GOOGLE_CLOUD_PROJECT).
+    // Initialize the Vertex AI gRPC client.
+    // Requires GOOGLE_CLOUD_PROJECT and either VERTEX_API_KEY or ADC credentials.
     let client = VertexClient::from_env();
 
     let agent = client

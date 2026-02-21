@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Vertex AI gRPC support (completion, streaming, embeddings)
+- Vertex AI API key auth support via `VERTEX_API_KEY` / `VertexClientBuilder::with_api_key()`
 
 ## [0.1.0] - 2026-01-14
 

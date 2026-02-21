@@ -42,6 +42,14 @@ pub enum VertexClientError {
     )]
     MissingProject,
 
+    #[error(
+        "conflicting auth configuration: both an API key and explicit credentials were provided"
+    )]
+    ConflictingAuth,
+
+    #[error("Vertex API key is empty")]
+    EmptyApiKey,
+
     #[error("gRPC transport error: {0}")]
     Transport(#[from] tonic::transport::Error),
 
@@ -74,6 +82,7 @@ pub struct VertexClientBuilder {
     location: Option<String>,
     endpoint: Option<VertexGrpcEndpoint>,
     credentials: Option<Credentials>,
+    api_key: Option<String>,
 }
 
 impl VertexClientBuilder {
@@ -112,6 +121,18 @@ impl VertexClientBuilder {
         self
     }
 
+    /// Set a Vertex AI API key explicitly.
+    ///
+    /// When set, the client authenticates using the `x-goog-api-key` header
+    /// instead of OAuth credentials.
+    ///
+    /// If not set, falls back to `VERTEX_API_KEY` (optional) or Application
+    /// Default Credentials (ADC).
+    pub fn with_api_key(mut self, api_key: &str) -> Self {
+        self.api_key = Some(api_key.to_string());
+        self
+    }
+
     pub async fn build(self) -> Result<VertexClient, VertexClientError> {
         let project = self
             .project
@@ -122,8 +143,6 @@ impl VertexClientBuilder {
             .location
             .or_else(|| std::env::var("GOOGLE_CLOUD_LOCATION").ok())
             .unwrap_or_else(|| DEFAULT_LOCATION.to_string());
-
-        let credentials = build_credentials(self.credentials)?;
 
         let endpoint = self.endpoint.unwrap_or_else(|| {
             if location == DEFAULT_LOCATION {
@@ -139,13 +158,14 @@ impl VertexClientBuilder {
             .await
             .map_err(VertexClientError::Transport)?;
 
+        let auth = build_auth(self.api_key, self.credentials)?;
+
         Ok(VertexClient {
             project,
             location,
             endpoint,
             channel,
-            credentials,
-            auth_header_cache: Arc::new(Mutex::new(AuthHeaderCache::default())),
+            auth,
         })
     }
 }
@@ -157,13 +177,23 @@ struct AuthHeaderCache {
 }
 
 #[derive(Clone)]
+enum VertexAuth {
+    ApiKey {
+        api_key: MetadataValue<tonic::metadata::Ascii>,
+    },
+    Credentials {
+        credentials: Credentials,
+        auth_header_cache: Arc<Mutex<AuthHeaderCache>>,
+    },
+}
+
+#[derive(Clone)]
 pub struct VertexClient {
     project: String,
     location: String,
     endpoint: VertexGrpcEndpoint,
     channel: Channel,
-    credentials: Credentials,
-    auth_header_cache: Arc<Mutex<AuthHeaderCache>>,
+    auth: VertexAuth,
 }
 
 impl Debug for VertexClient {
@@ -212,12 +242,24 @@ impl VertexClient {
         &self,
         request: &mut tonic::Request<T>,
     ) -> Result<(), VertexClientError> {
-        let headers = self.auth_headers().await?;
+        match &self.auth {
+            VertexAuth::ApiKey { api_key } => {
+                request
+                    .metadata_mut()
+                    .insert("x-goog-api-key", api_key.clone());
+            }
+            VertexAuth::Credentials {
+                credentials,
+                auth_header_cache,
+            } => {
+                let headers = oauth_headers(credentials, auth_header_cache).await?;
 
-        for (name, value) in headers.iter() {
-            let key = MetadataKey::from_bytes(name.as_str().as_bytes())?;
-            let value = MetadataValue::try_from(value.to_str()?)?;
-            request.metadata_mut().insert(key, value);
+                for (name, value) in headers.iter() {
+                    let key = MetadataKey::from_bytes(name.as_str().as_bytes())?;
+                    let value = MetadataValue::try_from(value.to_str()?)?;
+                    request.metadata_mut().insert(key, value);
+                }
+            }
         }
 
         request.metadata_mut().insert(
@@ -226,36 +268,6 @@ impl VertexClient {
         );
 
         Ok(())
-    }
-
-    async fn auth_headers(&self) -> Result<http::HeaderMap, VertexClientError> {
-        let (etag, cached_headers) = {
-            let guard = self.auth_header_cache.lock().await;
-            (guard.entity_tag.clone(), guard.headers.clone())
-        };
-
-        let mut extensions = http::Extensions::new();
-        if let Some(etag) = etag {
-            extensions.insert(etag);
-        }
-
-        let resource = self
-            .credentials
-            .headers(extensions)
-            .await
-            .map_err(VertexClientError::AuthHeaders)?;
-
-        match resource {
-            CacheableResource::NotModified => {
-                cached_headers.ok_or(VertexClientError::MissingCachedAuthHeaders)
-            }
-            CacheableResource::New { entity_tag, data } => {
-                let mut guard = self.auth_header_cache.lock().await;
-                guard.entity_tag = Some(entity_tag);
-                guard.headers = Some(data.clone());
-                Ok(data)
-            }
-        }
     }
 }
 
@@ -270,14 +282,14 @@ impl ProviderClient for VertexClient {
             tokio::runtime::Handle::current()
                 .block_on(VertexClientBuilder::new().build())
                 .expect(
-                    "Failed to build Vertex gRPC client. Ensure GOOGLE_CLOUD_PROJECT is set and ADC is configured (e.g. `gcloud auth application-default login`).",
+                    "Failed to build Vertex gRPC client. Ensure GOOGLE_CLOUD_PROJECT is set and either VERTEX_API_KEY is set or ADC is configured (e.g. `gcloud auth application-default login`).",
                 )
         })
     }
 
     fn from_val(_: Self::Input) -> Self {
         panic!(
-            "Vertex AI uses Application Default Credentials (ADC). Use `VertexClient::from_env()` or `VertexClient::builder()`."
+            "Vertex AI uses either an API key or Application Default Credentials (ADC). Use `VertexClient::from_env()` or `VertexClient::builder()`."
         );
     }
 }
@@ -327,6 +339,81 @@ fn build_credentials(
     }
 }
 
+fn build_auth(
+    api_key: Option<String>,
+    credentials: Option<Credentials>,
+) -> Result<VertexAuth, VertexClientError> {
+    let api_key = api_key.map(|key| key.trim().to_string());
+
+    if api_key.as_deref().is_some_and(str::is_empty) {
+        return Err(VertexClientError::EmptyApiKey);
+    }
+
+    if api_key.is_some() && credentials.is_some() {
+        return Err(VertexClientError::ConflictingAuth);
+    }
+
+    if let Some(api_key) = api_key {
+        let api_key = MetadataValue::try_from(api_key.as_str())?;
+        return Ok(VertexAuth::ApiKey { api_key });
+    }
+
+    if let Some(credentials) = credentials {
+        return Ok(VertexAuth::Credentials {
+            credentials,
+            auth_header_cache: Arc::new(Mutex::new(AuthHeaderCache::default())),
+        });
+    }
+
+    if let Ok(env_api_key) = std::env::var("VERTEX_API_KEY") {
+        let env_api_key = env_api_key.trim().to_string();
+        if env_api_key.is_empty() {
+            return Err(VertexClientError::EmptyApiKey);
+        }
+
+        let api_key = MetadataValue::try_from(env_api_key.as_str())?;
+        return Ok(VertexAuth::ApiKey { api_key });
+    }
+
+    let credentials = build_credentials(None)?;
+    Ok(VertexAuth::Credentials {
+        credentials,
+        auth_header_cache: Arc::new(Mutex::new(AuthHeaderCache::default())),
+    })
+}
+
+async fn oauth_headers(
+    credentials: &Credentials,
+    auth_header_cache: &Arc<Mutex<AuthHeaderCache>>,
+) -> Result<http::HeaderMap, VertexClientError> {
+    let (etag, cached_headers) = {
+        let guard = auth_header_cache.lock().await;
+        (guard.entity_tag.clone(), guard.headers.clone())
+    };
+
+    let mut extensions = http::Extensions::new();
+    if let Some(etag) = etag {
+        extensions.insert(etag);
+    }
+
+    let resource = credentials
+        .headers(extensions)
+        .await
+        .map_err(VertexClientError::AuthHeaders)?;
+
+    match resource {
+        CacheableResource::NotModified => {
+            cached_headers.ok_or(VertexClientError::MissingCachedAuthHeaders)
+        }
+        CacheableResource::New { entity_tag, data } => {
+            let mut guard = auth_header_cache.lock().await;
+            guard.entity_tag = Some(entity_tag);
+            guard.headers = Some(data.clone());
+            Ok(data)
+        }
+    }
+}
+
 async fn build_channel(endpoint: &VertexGrpcEndpoint) -> Result<Channel, tonic::transport::Error> {
     let endpoint = match endpoint {
         VertexGrpcEndpoint::Global => Endpoint::from_static(VERTEX_GLOBAL_GRPC_ENDPOINT)
@@ -353,4 +440,52 @@ async fn build_channel(endpoint: &VertexGrpcEndpoint) -> Result<Channel, tonic::
     };
 
     endpoint.connect().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn apply_auth_inserts_api_key_metadata() {
+        let auth = build_auth(Some("test-key".to_string()), None).expect("auth should build");
+
+        let channel = Endpoint::from_static("http://127.0.0.1:50051").connect_lazy();
+        let client = VertexClient {
+            project: "test-project".to_string(),
+            location: DEFAULT_LOCATION.to_string(),
+            endpoint: VertexGrpcEndpoint::Global,
+            channel,
+            auth,
+        };
+
+        let mut request = tonic::Request::new(());
+        client
+            .apply_auth(&mut request)
+            .await
+            .expect("apply_auth should succeed");
+
+        let api_key = request
+            .metadata()
+            .get("x-goog-api-key")
+            .expect("x-goog-api-key should be set");
+        assert_eq!(api_key.to_str().expect("api key is ascii"), "test-key");
+
+        let client_id = request
+            .metadata()
+            .get("x-goog-api-client")
+            .expect("x-goog-api-client should be set");
+        assert_eq!(
+            client_id.to_str().expect("client id is ascii"),
+            RIG_VERTEX_GRPC_CLIENT_IDENTIFIER
+        );
+    }
+
+    #[test]
+    fn build_auth_rejects_empty_api_key() {
+        assert!(matches!(
+            build_auth(Some("   ".to_string()), None),
+            Err(VertexClientError::EmptyApiKey)
+        ));
+    }
 }

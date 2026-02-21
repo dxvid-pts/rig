@@ -24,6 +24,31 @@ Set your Gemini API key as an environment variable:
 export GEMINI_API_KEY=your_api_key_here
 ```
 
+### Vertex AI setup
+
+To use the Vertex AI gRPC client (`VertexClient`), set your Google Cloud project:
+
+```shell
+export GOOGLE_CLOUD_PROJECT=your_gcp_project_id
+```
+
+Then authenticate using either:
+
+- A Vertex AI API key:
+  ```shell
+  export VERTEX_API_KEY=your_api_key_here
+  ```
+- Application Default Credentials (ADC):
+  ```shell
+  gcloud auth application-default login
+  ```
+
+Optionally set a location (defaults to `global`):
+
+```shell
+export GOOGLE_CLOUD_LOCATION=us-central1
+```
+
 ## Example
 
 ```rust

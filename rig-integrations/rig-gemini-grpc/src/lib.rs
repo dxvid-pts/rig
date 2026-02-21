@@ -23,6 +23,7 @@
 //! use rig_gemini_grpc::VertexClient;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! // Requires GOOGLE_CLOUD_PROJECT and either VERTEX_API_KEY or ADC credentials.
 //! let client = VertexClient::from_env();
 //! let _model = client.completion_model("gemini-2.5-flash");
 //! # Ok(())
